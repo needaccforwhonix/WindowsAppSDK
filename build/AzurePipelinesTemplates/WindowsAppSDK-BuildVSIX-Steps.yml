@@ -10,17 +10,42 @@ parameters:
   default: true
 - name: UseCurrentBuild
   type: boolean
-  default: false 
+  default: false
+# To override OptionalVSIXVersion's default, add 
+# OptionalVSIXVersion: 'x.y.z' to the parameters of
+# the stage that calls this template in the aggregator pipeline.
 - name: OptionalVSIXVersion
-  # if blank, the project template will select the version matching the Windows App SDK
-  # nuget. If provided, it should be a 4-part dotted version ('1.2.3.4')
   type: string
   default: 'default'
 - name: EnableExperimentalVSIXFeatures
   type: boolean
   default: false
+- name: PublishSymbols
+  # Defaults true to preserve official-build behavior.
+  # Set to false in PR build-validation runs to skip pushing to the symbol server.
+  type: boolean
+  default: true
+- name: NightlyBranchName
+  # Branch to pull the latest nightly nuget from (only when
+  # UseLatestNightlyFromBranch is true). The Aggregator nightly runs on 'main'.
+  type: string
+  default: 'refs/heads/main'
+- name: UseLatestNightlyFromBranch
+  # false (default): download a pinned nightly via $(LatestOfficialBuildID),
+  #   matching the Foundation VSIX stage (gated on a non-empty build id).
+  # true: pull the latest run from NightlyBranchName instead, for the Templates
+  #   PR pipeline, which has no pinned build id at queue time.
+  type: boolean
+  default: false
 
 steps:
+# Supports both root and subfolder Foundation checkouts.
+- template: AzurePipelinesTemplates\WindowsAppSDK-MaterializeTsaOptions-Steps.yml@WindowsAppSDKConfig
+  parameters:
+    componentTsaOptionsPath: '$(Build.SourcesDirectory)\$(FoundationRepoPath).config\tsaoptions.json'
+    areaPath: '$(WinAppSDKCoreTsaAreaPath)'
+    outputPath: '$(Build.SourcesDirectory)\.config\tsaoptions.json'
+
 - ${{ if eq(parameters.UseCurrentBuild, 'true') }}:
   - task: DownloadPipelineArtifact@2
     displayName: 'Download WindowsAppSDK From Current Build'
@@ -28,19 +53,38 @@ steps:
       artifactName: 'WindowsAppSDK_Nuget_And_MSIX'
       targetPath: '$(System.ArtifactsDirectory)'
 - ${{ else }}:
-  ###
-  # This step downloads the WindowsAppSDK NuGet package from a pipeline
-  # variables: OfficialPipelineID LatestOfficialBuildID
-  # for use in building the VSIX
-  - task: DownloadPipelineArtifact@2
-    displayName: 'Download WindowsAppSDK From Latest Nightly'
-    inputs:
-      artifactName: 'WindowsAppSDK_Nuget_And_MSIX'
-      targetPath: '$(System.ArtifactsDirectory)'
-      source: 'specific'
-      project: $(System.TeamProjectId)
-      pipeline: $(OfficialPipelineID) 
-      pipelineId: $(LatestOfficialBuildID) 
+  - ${{ if eq(parameters.UseLatestNightlyFromBranch, 'true') }}:
+    ###
+    # Templates PR path: grab the latest nightly from NightlyBranchName since no
+    # build id is pinned at queue time. Nightlies often end PartiallySucceeded
+    # (downstream test/SDL not green) yet still produce the artifact, so both
+    # allow* flags are required as a pair to accept non-succeeded runs.
+    - task: DownloadPipelineArtifact@2
+      displayName: 'Download WindowsAppSDK From Latest Nightly (by branch)'
+      inputs:
+        artifactName: 'WindowsAppSDK_Nuget_And_MSIX'
+        targetPath: '$(System.ArtifactsDirectory)'
+        source: 'specific'
+        project: $(System.TeamProjectId)
+        pipeline: $(OfficialPipelineID)
+        runVersion: 'latestFromBranch'
+        runBranch: '${{ parameters.NightlyBranchName }}'
+        allowPartiallySucceededBuilds: true
+        allowFailedBuilds: true
+  - ${{ else }}:
+    ###
+    # Default path (Foundation VSIX stage): download the pinned nightly named by
+    # $(LatestOfficialBuildID). The consuming stage is gated on a non-empty id,
+    # so it is skipped when no valid nightly is available.
+    - task: DownloadPipelineArtifact@2
+      displayName: 'Download WindowsAppSDK From Latest Nightly'
+      inputs:
+        artifactName: 'WindowsAppSDK_Nuget_And_MSIX'
+        targetPath: '$(System.ArtifactsDirectory)'
+        source: 'specific'
+        project: $(System.TeamProjectId)
+        pipeline: $(OfficialPipelineID)
+        pipelineId: $(LatestOfficialBuildID)
     
 - task: PowerShell@2
   name: ExtractWindowsAppSDKVersion
@@ -85,12 +129,18 @@ steps:
       }
       Exit 1
 
+- task: UseDotNet@2
+  displayName: 'Use .NET SDK 10.0.111'
+  inputs:
+    packageType: 'sdk'
+    version: '10.0.111'
+
 - task: NuGetAuthenticate@1
 
 - task: VSBuild@1
   displayName: 'Restore WindowsAppSDK.Extension.sln'
   inputs:
-    solution: $(FoundationRepoPath)dev\VSIX\WindowsAppSDK.Extension.sln
+    solution: $(FoundationRepoPath)dev\Templates\VSIX\WindowsAppSDK.Extension.sln
     platform: 'Any CPU'
     configuration: '$(buildConfiguration)'
     msBuildArgs: '/t:restore /p:OptionalVSIXVersion="${{ parameters.OptionalVSIXVersion }}" /p:WindowsAppSDKVersion="$(WindowsAppSDKPackageVersion)" /p:RestoreAdditionalProjectSources="$(System.ArtifactsDirectory)" /p:EnableExperimentalVSIXFeatures="${{ parameters.EnableExperimentalVSIXFeatures }}" /binaryLogger:$(ob_outputDirectory)\binlogs\StandaloneVSIX.restore.binlog'
@@ -98,7 +148,7 @@ steps:
 - task: VSBuild@1
   displayName: 'Build Standalone WindowsAppSDK.Extension.sln'
   inputs:
-    solution: $(FoundationRepoPath)dev\VSIX\WindowsAppSDK.Extension.sln
+    solution: $(FoundationRepoPath)dev\Templates\VSIX\WindowsAppSDK.Extension.sln
     platform: 'Any CPU'
     configuration: '$(buildConfiguration)'
     msBuildArgs: '/p:OptionalVSIXVersion="${{ parameters.OptionalVSIXVersion }}" /p:WindowsAppSDKVersion="$(WindowsAppSDKPackageVersion)" /p:EnableExperimentalVSIXFeatures="${{ parameters.EnableExperimentalVSIXFeatures }}" /binaryLogger:$(ob_outputDirectory)\binlogs\StandaloneVSIX.build.binlog'
@@ -124,7 +174,7 @@ steps:
 - task: VSBuild@1
   displayName: 'Restore Component WindowsAppSDK.Extension.sln'
   inputs:
-    solution: $(FoundationRepoPath)dev\VSIX\WindowsAppSDK.Extension.sln
+    solution: $(FoundationRepoPath)dev\Templates\VSIX\WindowsAppSDK.Extension.sln
     platform: 'Any CPU'
     configuration: '$(buildConfiguration)'
     msBuildArgs: '/t:restore /p:OptionalVSIXVersion="${{ parameters.OptionalVSIXVersion }}" /p:WindowsAppSDKVersion="$(WindowsAppSDKPackageVersion)" /p:RestoreAdditionalProjectSources="$(System.ArtifactsDirectory)" /p:EnableExperimentalVSIXFeatures="${{ parameters.EnableExperimentalVSIXFeatures }}" /binaryLogger:$(ob_outputDirectory)\binlogs\ComponentVSIX.restore.binlog' 
@@ -132,7 +182,7 @@ steps:
 - task: VSBuild@1
   displayName: 'Build Component WindowsAppSDK.Extension.sln'
   inputs:
-    solution: $(FoundationRepoPath)dev\VSIX\WindowsAppSDK.Extension.sln
+    solution: $(FoundationRepoPath)dev\Templates\VSIX\WindowsAppSDK.Extension.sln
     platform: 'Any CPU'
     configuration: '$(buildConfiguration)'
     msBuildArgs: '/restore /p:OptionalVSIXVersion="${{ parameters.OptionalVSIXVersion }}" /p:WindowsAppSDKVersion="$(WindowsAppSDKPackageVersion)" /p:EnableExperimentalVSIXFeatures="${{ parameters.EnableExperimentalVSIXFeatures }}" /p:Deployment="Component" /binaryLogger:$(ob_outputDirectory)\binlogs\ComponentVSIX.build.binlog'
@@ -165,7 +215,7 @@ steps:
   - task: CopyFiles@2
     displayName: 'Stage unsigned VSIX files for publishing'
     inputs:
-      SourceFolder: '$(FoundationRepoPath)dev\VSIX\BuildOutput\obj\AnyCPU$(buildConfiguration)'
+      SourceFolder: '$(FoundationRepoPath)dev\Templates\VSIX\BuildOutput\obj\AnyCPU$(buildConfiguration)'
       Contents: '**/WindowsAppSDK.*.vsix'
       flattenFolders: true
       TargetFolder: '$(ob_outputDirectory)\VSIX'
@@ -174,7 +224,7 @@ steps:
   - task: CopyFiles@2
     displayName: 'Stage unsigned VSIX files for signing'
     inputs:
-      SourceFolder: '$(FoundationRepoPath)dev\VSIX\BuildOutput\obj\AnyCPU$(buildConfiguration)'
+      SourceFolder: '$(FoundationRepoPath)dev\Templates\VSIX\BuildOutput\obj\AnyCPU$(buildConfiguration)'
       Contents: '**/WindowsAppSDK.*.vsix'
       flattenFolders: true
       TargetFolder: '$(Agent.TempDirectory)/UnsignedVSIX'
@@ -193,15 +243,16 @@ steps:
       codeSignPattern: |
         **/WindowsAppSDK.*.Extension.*.dll
         
-- template: ${{variables['System.DefaultWorkingDirectory']}}\AzurePipelinesTemplates\WindowsAppSDK-PublishSymbol-Steps.yml@WindowsAppSDKConfig
-  parameters:
-    SearchPattern: '$(FoundationRepoPath)dev\VSIX\BuildOutput\obj\AnyCPU$(buildConfiguration)\**\WindowsAppSDK*.pdb'
-    IsOfficial: ${{ parameters.IsOfficial }}
+- ${{ if eq(parameters.PublishSymbols, true) }}:
+  - template: ${{variables['System.DefaultWorkingDirectory']}}\AzurePipelinesTemplates\WindowsAppSDK-PublishSymbol-Steps.yml@WindowsAppSDKConfig
+    parameters:
+      SearchPattern: '$(FoundationRepoPath)dev\Templates\VSIX\BuildOutput\obj\AnyCPU$(buildConfiguration)\**\WindowsAppSDK*.pdb'
+      IsOfficial: ${{ parameters.IsOfficial }}
 
 - task: CopyFiles@2
   displayName: 'Stage VSIX component JSONs'
   inputs:
-    SourceFolder: '$(FoundationRepoPath)dev\VSIX\BuildOutput\obj\AnyCPU$(buildConfiguration)'
+    SourceFolder: '$(FoundationRepoPath)dev\Templates\VSIX\BuildOutput\obj\AnyCPU$(buildConfiguration)'
     Contents: '**/WindowsAppSDK*.pdb'
     flattenFolders: true
     TargetFolder: '$(ob_outputDirectory)\symbols'
@@ -209,7 +260,7 @@ steps:
 - task: CopyFiles@2
   displayName: 'Stage VSIX component JSONs'
   inputs:
-    SourceFolder: '$(FoundationRepoPath)dev\VSIX\BuildOutput\obj\AnyCPU$(buildConfiguration)'
+    SourceFolder: '$(FoundationRepoPath)dev\Templates\VSIX\BuildOutput\obj\AnyCPU$(buildConfiguration)'
     Contents: '**/WindowsAppSDK.*.Component.json'
     flattenFolders: true
     TargetFolder: '$(ob_outputDirectory)'
@@ -217,7 +268,7 @@ steps:
 - task: CopyFiles@2
   displayName: 'Stage VSIX manifest'
   inputs:
-    SourceFolder: '$(FoundationRepoPath)dev\VSIX'
+    SourceFolder: '$(FoundationRepoPath)dev\Templates\VSIX'
     Contents: 'extension.manifest.json'
     flattenFolders: true
     TargetFolder: '$(ob_outputDirectory)'
@@ -225,7 +276,7 @@ steps:
 - task: CopyFiles@2
   displayName: 'Stage VSIX overview markdown'
   inputs:
-    SourceFolder: '$(FoundationRepoPath)dev\VSIX'
+    SourceFolder: '$(FoundationRepoPath)dev\Templates\VSIX'
     Contents: 'overview.md'
     flattenFolders: true
     TargetFolder: '$(ob_outputDirectory)'
